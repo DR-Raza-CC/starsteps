@@ -22,6 +22,17 @@ functions/api.js  – Cloudflare Pages Function: saves family data in KV
 
 If storage isn't connected yet, the app still works, but it saves to that one device only and shows a yellow banner.
 
+## Admin page (just for you)
+1. Cloudflare → your starsteps Pages project → Settings → **Variables and Secrets** → Add → type **Secret**, name **`ADMIN_KEY`**, value = a long password only you know. Save.
+2. Deployments → **Retry deployment**.
+3. Open `https://starsteps.pages.dev/#admin` and enter your admin key. You'll see how many families and children use the app, who was active today, roughly how many of the 1,000 free daily saves have been used, and a delete button for each family.
+
+## Security features
+- **Recovery code:** shown once when a family is created. "Forgot password?" on the sign-in screen uses it to set a new password, and a fresh recovery code is issued each time. Families created before this update can make one in Parent area → ⚙️ Family.
+- **Lockout:** after 5 wrong passwords, that family code is locked for 15 minutes. The recovery code still works during a lockout.
+- **Delete our family:** Parent area → ⚙️ Family. It needs the password and the word DELETE.
+- **Privacy note** on the sign-in screen.
+
 ## How it works
 - **Family code and password** sign in any device. Kids tap their own avatar. The parent area asks for the password again.
 - **Each child** has a name, a school year (Reception to Year 6) and subjects (Maths and/or English).

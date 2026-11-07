@@ -68,6 +68,8 @@ async function sha(text) {
 }
 const normCode = c => String(c || '').trim().toLowerCase().replace(/\s+/g, '');
 const codeOK = c => /^[a-z0-9_-]{4,30}$/.test(c);
+const normRec = r => String(r || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+function makeRecovery() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; for (let i = 0; i < 12; i++) { s += A[Math.floor(Math.random() * A.length)]; if (i === 3 || i === 7) s += '-'; } return s; }
 
 /* ---------- storage: cloud (Cloudflare KV via /api) with a this-device fallback ---------- */
 const Local = {
@@ -76,19 +78,23 @@ const Local = {
   save() { ls.set('starsteps_local_v1', this.mem); },
   async call(a, b) {
     const d = this.db();
-    if (a === 'create' || a === 'login') {
+    if (a === 'admin' || a === 'adminDelete') throw new Error('The admin page only works on your live Cloudflare site.');
+    if (a === 'create' || a === 'login' || a === 'recover') {
       const code = normCode(b.code); if (!codeOK(code)) throw new Error('Family code must be 4–30 letters or numbers (no spaces).');
       if (!b.password || String(b.password).length < 4) throw new Error('Password must be at least 4 characters.');
-      const f = d.fams[code];
-      if (a === 'create') { if (f) throw new Error('That family code is already used on this device — sign in instead.'); const salt = uid(); d.fams[code] = { salt, hash: await sha(salt + ':' + b.password), family: { kids: [], created: Date.now() } }; }
+      const f = d.fams[code]; let recovery;
+      if (a === 'create') { if (f) throw new Error('That family code is already used on this device — sign in instead.'); const salt = uid(); d.fams[code] = { salt, hash: await sha(salt + ':' + b.password), family: { kids: [], created: Date.now() } }; recovery = await this.setRec(d.fams[code]); }
+      else if (a === 'recover') { if (!f || !f.rhash || await sha(f.rsalt + ':' + normRec(b.recovery)) !== f.rhash) throw new Error('Family code or recovery code is not right.'); f.salt = uid(); f.hash = await sha(f.salt + ':' + b.password); recovery = await this.setRec(f); }
       else if (!f || await sha(f.salt + ':' + b.password) !== f.hash) throw new Error('Family code or password is not right.');
       const token = 'l_' + uid(); d.toks[token] = code; this.save();
-      return { token, code, family: d.fams[code].family, kids: this.kidsOf(code) };
+      return { token, code, family: d.fams[code].family, kids: this.kidsOf(code), recovery, hasRecovery: !!d.fams[code].rhash };
     }
     const code = d.toks[b.token]; if (!code || !d.fams[code]) { const e = new Error('Please sign in again.'); e.relogin = true; throw e; }
     const F = d.fams[code];
     switch (a) {
-      case 'load': return { code, family: F.family, kids: this.kidsOf(code) };
+      case 'load': return { code, family: F.family, kids: this.kidsOf(code), hasRecovery: !!F.rhash };
+      case 'newRecovery': if (await sha(F.salt + ':' + b.password) !== F.hash) throw new Error('That password is not right.'); { const recovery = await this.setRec(F); this.save(); return { recovery }; }
+      case 'deleteFamily': if (await sha(F.salt + ':' + b.password) !== F.hash) throw new Error('That password is not right.'); for (const id of F.family.kids) delete d.kids[code + ':' + id]; delete d.fams[code]; delete d.toks[b.token]; this.save(); return { ok: true };
       case 'getKid': return { kid: d.kids[code + ':' + b.id] || null };
       case 'saveKid': d.kids[code + ':' + b.kid.id] = b.kid; if (!F.family.kids.includes(b.kid.id)) F.family.kids.push(b.kid.id); this.save(); return { ok: true };
       case 'deleteKid': delete d.kids[code + ':' + b.id]; F.family.kids = F.family.kids.filter(x => x !== b.id); this.save(); return { ok: true };
@@ -98,6 +104,7 @@ const Local = {
     }
     throw new Error('Unknown action');
   },
+  async setRec(f) { const rc = makeRecovery(); f.rsalt = uid(); f.rhash = await sha(f.rsalt + ':' + normRec(rc)); return rc; },
   kidsOf(code) { const d = this.db(), o = {}; for (const id of d.fams[code].family.kids) if (d.kids[code + ':' + id]) o[id] = d.kids[code + ':' + id]; return o; }
 };
 const Backend = {
@@ -116,7 +123,7 @@ const Backend = {
 };
 
 /* ---------- state ---------- */
-const S = { session: null, family: null, kids: {}, kidId: null, parentOK: 0, parentKid: null, quiz: null, pending: new Set() };
+const S = { hasRecovery: true, session: null, family: null, kids: {}, kidId: null, parentOK: 0, parentKid: null, quiz: null, pending: new Set() };
 const kid = () => S.kids[S.kidId];
 const today = () => dayKey();
 
@@ -160,13 +167,14 @@ function renderWelcome(msg = '') {
   <p class="center muted" style="margin-top:-4px">Little steps every day. Big stars for life.</p>
   <div class="card">
     <div class="tabs"><button class="${authTab === 'login' ? 'on' : ''}" onclick="authTab='login';renderWelcome()">Sign in</button><button class="${authTab === 'create' ? 'on' : ''}" onclick="authTab='create';renderWelcome()">New family</button></div>
-    <form onsubmit="event.preventDefault();doAuth()">
+    ${authTab === 'recover' ? recoverForm() : `<form onsubmit="event.preventDefault();doAuth()">
       <label>Family code</label><input id="fcode" autocomplete="username" autocapitalize="none" placeholder="e.g. husain-family" value="${esc(ls.get('starsteps_lastcode') || '')}">
       <label>Password</label><input id="fpass" type="password" autocomplete="${authTab === 'create' ? 'new-password' : 'current-password'}" placeholder="At least 4 characters">
       ${authTab === 'create' ? '<label>Password again</label><input id="fpass2" type="password" autocomplete="new-password">' : ''}
       <div id="amsg">${msg}</div>
       <button class="btn block ${authTab === 'create' ? 'org' : ''}" style="margin-top:14px" id="abtn">${authTab === 'create' ? '✨ Create our family' : '🚀 Sign in'}</button>
-    </form>
+    </form>`}
+    ${authTab === 'login' ? `<p class="center" style="margin:12px 0 0"><button class="speak" onclick="authTab='recover';renderWelcome()">🔑 Forgot password?</button></p>` : ''}
   </div>
   <div class="card small muted">
     <b style="color:var(--ink)">How it works</b><br>
@@ -174,8 +182,48 @@ function renderWelcome(msg = '') {
     📖 Each day: a short lesson, a game, then a 10-question daily test.<br>
     🔁 Wrong answers come back until they're mastered.<br>
     🏆 Weekly test, streaks, stickers and a pet to grow. Parents see every result.
-  </div>`);
+  </div>
+  <div class="card small muted"><b style="color:var(--ink)">🔒 Privacy</b><br>StarSteps stores only your family code, a scrambled (hashed) password, each child's first name, school year and learning progress. Nothing is shared or sold, and there are no adverts. You can delete your whole family at any time in Parent area → ⚙️ Family.</div>`);
 }
+function recoverForm() {
+  return `<form onsubmit="event.preventDefault();doRecover()">
+    <h3 style="margin-top:12px">🔑 Reset your password</h3>
+    <p class="small muted">Use the recovery code you saved when you made your family.</p>
+    <label>Family code</label><input id="rcode" autocapitalize="none" value="${esc(ls.get('starsteps_lastcode') || '')}">
+    <label>Recovery code</label><input id="rrec" autocapitalize="characters" placeholder="XXXX-XXXX-XXXX">
+    <label>New password</label><input id="rpass" type="password" autocomplete="new-password">
+    <label>New password again</label><input id="rpass2" type="password" autocomplete="new-password">
+    <div id="amsg"></div>
+    <button class="btn block org" style="margin-top:14px" id="abtn">Reset password</button>
+    <p class="center" style="margin:12px 0 0"><button type="button" class="speak" onclick="authTab='login';renderWelcome()">← Back to sign in</button></p>
+  </form>`;
+}
+async function doRecover() {
+  const code = normCode($('#rcode').value), rec = $('#rrec').value, pw = $('#rpass').value;
+  const fail = m => { $('#amsg').innerHTML = `<div class="err">${esc(m)}</div>`; $('#abtn').disabled = false; };
+  if (!codeOK(code)) return fail('Please enter your family code.');
+  if (normRec(rec).length !== 12) return fail('The recovery code has 12 letters and numbers, like ABCD-EFGH-JK23.');
+  if (pw.length < 4) return fail('New password must be at least 4 characters.');
+  if (pw !== $('#rpass2').value) return fail('The two passwords don\'t match.');
+  $('#abtn').disabled = true;
+  try { const r = await Backend.call('recover', { code, password: pw, recovery: rec }); startSession(r); renderWho(); showRecovery(r.recovery, 'Password changed ✓ Your old recovery code no longer works — here is your new one.'); }
+  catch (e) { fail(e.message); }
+}
+function startSession(r) {
+  S.session = { token: r.token, code: r.code, mode: Backend.mode }; ls.set('starsteps_session', S.session); ls.set('starsteps_lastcode', r.code);
+  S.family = r.family; S.kids = {}; for (const [id, k] of Object.entries(r.kids || {})) S.kids[id] = fixKid(k);
+  S.hasRecovery = r.hasRecovery !== false;
+}
+function showRecovery(rc, intro) {
+  S.hasRecovery = true;
+  modal(`<div class="center" style="font-size:48px">🔑</div><h2 class="center">Your recovery code</h2>
+  <p class="small">${esc(intro || 'If you ever forget your password, this code lets you reset it.')} <b>Write it down or screenshot it now</b> — it won't be shown again.</p>
+  <div style="font-size:28px;font-weight:700;letter-spacing:2px;text-align:center;background:#FFF4CC;border:2px dashed #F3C64B;border-radius:14px;padding:14px;margin:10px 0;user-select:all">${esc(rc)}</div>
+  <button class="btn ghost block" onclick="copyText('${esc(rc)}')">📋 Copy code</button>
+  <div class="checks"><label><input type="checkbox" onchange="$('#rcdone').disabled=!this.checked"> I've saved my recovery code</label></div>
+  <button class="btn block" id="rcdone" disabled onclick="closeModal()">Done</button>`);
+}
+async function copyText(t) { try { await navigator.clipboard.writeText(t); toast('Copied ✓'); } catch (e) { toast('Press and hold the code to copy it'); } }
 async function doAuth() {
   const code = normCode($('#fcode').value), pw = $('#fpass').value;
   const fail = m => { $('#amsg').innerHTML = `<div class="err">${esc(m)}</div>`; $('#abtn').disabled = false; };
@@ -185,9 +233,8 @@ async function doAuth() {
   $('#abtn').disabled = true;
   try {
     const r = await Backend.call(authTab, { code, password: pw });
-    S.session = { token: r.token, code: r.code, mode: Backend.mode }; ls.set('starsteps_session', S.session); ls.set('starsteps_lastcode', code);
-    S.family = r.family; S.kids = {}; for (const [id, k] of Object.entries(r.kids || {})) S.kids[id] = fixKid(k);
-    if (authTab === 'create') { S.parentOK = Date.now(); renderParent(); toast('Family created! Now add your first child.'); }
+    startSession(r);
+    if (authTab === 'create') { S.parentOK = Date.now(); renderParent(); showRecovery(r.recovery, 'Family created! 🎉 Next, add your first child. But first: if you ever forget your password, this code lets you reset it.'); }
     else renderWho();
   } catch (e) { fail(e.message); }
 }
@@ -585,10 +632,44 @@ async function doReset(id) { const o = S.kids[id], k = newKid(o.name, o.year, o.
 function delKid(id) { const k = S.kids[id]; modal(`<h2>Remove ${esc(k.name)}?</h2><p>All of ${esc(k.name)}'s progress will be deleted.</p><div class="grid2"><button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn red" onclick="doDel('${id}')">Remove</button></div>`); }
 async function doDel(id) { try { await Backend.call('deleteKid', { token: S.session.token, id }); delete S.kids[id]; S.family.kids = S.family.kids.filter(x => x !== id); closeModal(); renderParent(); } catch (e) { toast(e.message); } }
 function familyPanel() {
-  return `<div class="card"><h2>⚙️ Family settings</h2><p>Family code: <b>${esc(S.session.code)}</b><br><span class="small muted">Use this code and your password to sign in on any device. Children choose their own name after that.</span></p>
+  return `${S.hasRecovery ? '' : `<div class="banner">🔑 <b>No recovery code yet.</b> Make one below so you can reset your password if you forget it.</div>`}
+  <div class="card"><h2>⚙️ Family settings</h2><p>Family code: <b>${esc(S.session.code)}</b><br><span class="small muted">Use this code and your password to sign in on any device. Children choose their own name after that.</span></p>
   <h3>Change password</h3><form onsubmit="event.preventDefault();changePw()"><label>Current password</label><input type="password" id="op" autocomplete="current-password"><label>New password</label><input type="password" id="np" autocomplete="new-password"><div id="pwmsg"></div><button class="btn block" style="margin-top:12px">Change password</button></form></div>
-  <button class="btn ghost block" onclick="signOut()">🚪 Sign out on this device</button>`;
+  <div class="card"><h3>🔑 Recovery code</h3><p class="small muted">Lets you reset your password from the sign-in screen. Making a new one cancels the old one.</p>
+    <form onsubmit="event.preventDefault();newRecovery()"><label>Family password</label><input type="password" id="rcp" autocomplete="current-password"><div id="rcmsg"></div><button class="btn org block" style="margin-top:12px">${S.hasRecovery ? 'Make a new recovery code' : 'Create my recovery code'}</button></form></div>
+  <button class="btn ghost block" onclick="signOut()">🚪 Sign out on this device</button>
+  <div class="card" style="margin-top:18px;border-color:#FECACA"><h3>🗑 Delete our family</h3><p class="small muted">Permanently deletes your family code, every child and all their progress. This can't be undone.</p>
+    <form onsubmit="event.preventDefault();deleteFamily()"><label>Family password</label><input type="password" id="dfp" autocomplete="current-password"><label>Type DELETE to confirm</label><input id="dfc" autocapitalize="characters"><div id="dfmsg"></div><button class="btn red block" style="margin-top:12px">Delete everything</button></form></div>`;
 }
+async function newRecovery() { try { const r = await Backend.call('newRecovery', { token: S.session.token, password: $('#rcp').value }); renderParent('family'); showRecovery(r.recovery); } catch (e) { if (e.relogin) return signOut(true); $('#rcmsg').innerHTML = `<div class="err">${esc(e.message)}</div>`; } }
+async function deleteFamily() {
+  if ($('#dfc').value.trim().toUpperCase() !== 'DELETE') return ($('#dfmsg').innerHTML = '<div class="err">Type DELETE to confirm.</div>');
+  try { await Backend.call('deleteFamily', { token: S.session.token, password: $('#dfp').value }); ls.del('starsteps_session'); ls.del('starsteps_lastcode'); Object.assign(S, { session: null, family: null, kids: {}, kidId: null, parentOK: 0 }); Backend.mode = null; authTab = 'login'; renderWelcome('<div class="ok">Your family and all its data have been deleted.</div>'); }
+  catch (e) { if (e.relogin) return signOut(true); $('#dfmsg').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+
+/* ================= ADMIN (open yoursite/#admin) ================= */
+let ADMIN_KEY = '';
+async function renderAdmin(msg = '') {
+  if (!ADMIN_KEY) return show(`<div class="logo" style="font-size:30px">⭐ Star<span>Steps</span> admin</div><div class="card"><form onsubmit="event.preventDefault();ADMIN_KEY=$('#akey').value;renderAdmin()"><label>Admin key</label><input id="akey" type="password" autocomplete="off"><div>${msg}</div><button class="btn block" style="margin-top:12px">Open</button></form></div><p class="center"><a class="speak" href="#" onclick="location.hash='';location.reload()">← Back to the app</a></p>`);
+  show('<p class="center muted" style="margin-top:30vh">Loading admin…</p>');
+  let r; try { r = await Backend.call('admin', { key: ADMIN_KEY }); } catch (e) { ADMIN_KEY = ''; return renderAdmin(`<div class="err">${esc(e.message)}</div>`); }
+  const T = r.totals, left = Math.max(0, 1000 - T.savesToday);
+  show(`<div class="row between"><h1 style="margin:0">🛠 Admin</h1><button class="btn sm ghost" onclick="renderAdmin()">↻ Refresh</button></div>
+  <div class="grid3" style="margin-top:12px;text-align:center">
+    <div class="card" style="margin:0"><div style="font-size:28px;font-weight:700">${T.families}</div><span class="small muted">families</span></div>
+    <div class="card" style="margin:0"><div style="font-size:28px;font-weight:700">${T.kids}</div><span class="small muted">children</span></div>
+    <div class="card" style="margin:0"><div style="font-size:28px;font-weight:700">${T.activeToday}</div><span class="small muted">active today</span></div>
+  </div>
+  <div class="card"><h3>💾 Saves today (${esc(r.today)})</h3><div class="bar" style="height:16px"><i style="width:${Math.min(100, T.savesToday / 10)}%;${T.savesToday > 800 ? 'background:var(--red)' : ''}"></i></div>
+    <p><b>≈ ${T.savesToday}</b> of 1,000 free daily saves used · <b>≈ ${left}</b> left · ${T.questionsToday} questions answered today</p>
+    <p class="small muted">Estimated from today's finished activities (one save each), plus a few for rewards and settings. The limit is shared with your other Cloudflare apps and resets at midnight UTC. Exact figures: Cloudflare → Storage &amp; databases → KV → starsteps → Metrics.</p></div>
+  <div class="card"><h3>👪 Families</h3>${r.families.length ? `<table><tr><th>Code</th><th>Children</th><th>Last active</th><th></th></tr>${r.families.map(f => `<tr><td><b>${esc(f.code)}</b>${f.recovery ? '' : ' <span class="pill a" title="No recovery code">no 🔑</span>'}<br><span class="small muted">${f.created ? 'since ' + new Date(f.created).toLocaleDateString('en-GB') : ''}</span></td><td>${f.kids}<br><span class="small muted">${esc(f.names.join(', '))}</span></td><td class="small">${f.last ? niceDate(f.last) : '—'}${f.today ? `<br><span class="pill g">${f.today} today</span>` : ''}</td><td><button class="btn red sm" onclick="adminDelete('${esc(f.code)}')">🗑</button></td></tr>`).join('')}</table>` : '<p class="muted">No families yet.</p>'}
+    <p class="small muted">To help a family that's locked out with no recovery code: delete their family here, and they can make it again with the same code.</p></div>
+  <p class="center"><a class="speak" href="#" onclick="ADMIN_KEY='';location.hash='';location.reload()">← Leave admin</a></p>`);
+}
+function adminDelete(code) { modal(`<h2>Delete "${esc(code)}"?</h2><p>This removes the family and all of its children's progress. It can't be undone.</p><div class="grid2"><button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn red" onclick="doAdminDelete('${esc(code)}')">Delete</button></div>`); }
+async function doAdminDelete(code) { try { await Backend.call('adminDelete', { key: ADMIN_KEY, code }); closeModal(); toast('Deleted ' + code); renderAdmin(); } catch (e) { toast(e.message); } }
 async function changePw() { try { await Backend.call('password', { token: S.session.token, old: $('#op').value, password: $('#np').value }); $('#pwmsg').innerHTML = '<div class="ok">Password changed ✓</div>'; } catch (e) { $('#pwmsg').innerHTML = `<div class="err">${esc(e.message)}</div>`; } }
 function reportText(k) {
   const t = today(), w = Array.from({ length: 7 }, (_, i) => k.days[addDays(t, i - 6)] || { q: 0, c: 0 }), q = w.reduce((s, d) => s + d.q, 0), c = w.reduce((s, d) => s + d.c, 0), wk = weekKey();
@@ -606,9 +687,11 @@ async function copyReport(id) {
 /* ================= START ================= */
 (async function boot() {
   const sess = ls.get('starsteps_session');
+  if (location.hash === '#admin') return renderAdmin();
   if (!sess) return renderWelcome();
   S.session = sess; Backend.mode = sess.mode || null;
   show('<div class="logo" style="margin-top:30vh">⭐ Star<span>Steps</span></div><p class="center muted">Loading…</p>');
-  try { const r = await Backend.call('load', { token: sess.token }); S.family = r.family; S.kids = {}; for (const [id, k] of Object.entries(r.kids || {})) S.kids[id] = fixKid(k); renderWho(); }
+  try { const r = await Backend.call('load', { token: sess.token }); S.hasRecovery = r.hasRecovery !== false; S.family = r.family; S.kids = {}; for (const [id, k] of Object.entries(r.kids || {})) S.kids[id] = fixKid(k); renderWho(); }
   catch (e) { if (e.relogin) return signOut(true); show(`<div class="card center" style="margin-top:20vh"><div style="font-size:50px">📡</div><p>${esc(e.message)}</p><button class="btn" onclick="location.reload()">Try again</button></div>`); }
 })();
+window.addEventListener('hashchange', () => { if (location.hash === '#admin') renderAdmin(); });
